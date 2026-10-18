@@ -1,6 +1,8 @@
+import { setDefaultResultOrder } from "node:dns";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { extname, join } from "node:path";
+import { basename, extname, join } from "node:path";
+import { getFlowMusicPage } from "./chrome.js";
 import {
   formatSecondsToTimestamp,
   formatShotId,
@@ -9,25 +11,64 @@ import {
 } from "./storyboard.js";
 import type { CharacterSpec, LyricSegment, SceneShot, StoryboardProject } from "./types.js";
 
+// Ensure IPv4 is tried first on Windows so Node's fetch() to generativelanguage.googleapis.com never hangs on IPv6 timeouts
+try {
+  setDefaultResultOrder("ipv4first");
+} catch {
+  // Ignore if unsupported
+}
+
 export const HOME_DIR = process.env.FLOW_MUSIC_MCP_HOME ?? join(homedir(), ".flow-music-mcp");
 const LEGACY_FLOW_HOME = join(homedir(), ".flow-mcp");
-const KEY_FILE = join(HOME_DIR, "gemini-key");
+export const KEY_FILE = join(HOME_DIR, "gemini-key");
 const LEGACY_KEY_FILE = join(LEGACY_FLOW_HOME, "gemini-key");
+export const CONFIG_FILE = join(HOME_DIR, "config.json");
 
-const GEMINI_AUDIO_MODEL = process.env.FLOW_MUSIC_GEMINI_MODEL ?? "gemini-2.5-flash";
-const GEMINI_IMAGE_MODELS = [
-  process.env.FLOW_MUSIC_GEMINI_IMAGE_MODEL,
-  "gemini-2.5-flash-image-preview",
-  "gemini-2.0-flash-preview-image-generation",
-  "imagen-3.0-generate-002",
-].filter((m): m is string => Boolean(m));
+export interface RuntimeConfig {
+  gemini_audio_model?: string;
+  gemini_image_model?: string;
+  prefer_browser_image_generation?: boolean;
+}
 
+export function loadRuntimeConfig(): RuntimeConfig {
+  try {
+    if (existsSync(CONFIG_FILE)) {
+      return JSON.parse(readFileSync(CONFIG_FILE, "utf8")) as RuntimeConfig;
+    }
+  } catch {
+    // Ignore parse errors
+  }
+  return {};
+}
+
+export function saveRuntimeConfig(update: Partial<RuntimeConfig>): RuntimeConfig {
+  mkdirSync(HOME_DIR, { recursive: true });
+  const current = loadRuntimeConfig();
+  const next = { ...current, ...update };
+  writeFileSync(CONFIG_FILE, JSON.stringify(next, null, 2), "utf8");
+  return next;
+}
+
+// Current 2026 Gemini Image models verified on Google AI Studio
+export const DEFAULT_GEMINI_IMAGE_MODELS = [
+  "gemini-3.1-flash-image",
+  "gemini-nano-banana-2.1",
+  "gemini-2.5-flash-image",
+  "gemini-3-pro-image",
+  "gemini-3.1-flash-lite-image",
+  "nano-banana-pro-preview",
+];
+
+/**
+ * Resolves the Gemini API key dynamically on every call (no restart needed).
+ * Supports both traditional 'AIza...' keys and newer 2026 'AQ....' Google AI Studio keys.
+ */
 export function getGeminiApiKey(): string | undefined {
   const candidates = [
-    process.env.GEMINI_API_KEY,
-    process.env.GOOGLE_API_KEY,
     existsSync(KEY_FILE) ? readFileSync(KEY_FILE, "utf8") : undefined,
     existsSync(LEGACY_KEY_FILE) ? readFileSync(LEGACY_KEY_FILE, "utf8") : undefined,
+    process.env.GEMINI_API_KEY,
+    process.env.GOOGLE_API_KEY,
   ];
   for (const raw of candidates) {
     const key = (raw ?? "").trim();
@@ -38,14 +79,54 @@ export function getGeminiApiKey(): string | undefined {
   return undefined;
 }
 
-export function saveGeminiApiKey(apiKey: string): string {
+export async function saveAndVerifyGeminiApiKey(apiKey: string): Promise<{
+  key_file: string;
+  key_prefix: string;
+  verified: boolean;
+  available_image_models: string[];
+  available_audio_models: string[];
+  note?: string;
+}> {
   const trimmed = apiKey.trim();
   if (trimmed.length < 20) {
     throw new Error("Invalid Gemini API key: key looks too short.");
   }
   mkdirSync(HOME_DIR, { recursive: true });
   writeFileSync(KEY_FILE, trimmed, { encoding: "utf8", mode: 0o600 });
-  return KEY_FILE;
+
+  let verified = false;
+  let imageModels: string[] = [];
+  let audioModels: string[] = [];
+  let note: string | undefined;
+
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(trimmed)}`,
+      { signal: AbortSignal.timeout(10_000) }
+    );
+    if (res.ok) {
+      verified = true;
+      const data = (await res.json()) as { models?: Array<{ name?: string }> };
+      const names = (data.models ?? [])
+        .map((m) => (m.name ?? "").replace(/^models\//, ""))
+        .filter(Boolean);
+      imageModels = names.filter((n) => /image|imagen|banana/i.test(n));
+      audioModels = names.filter((n) => /flash|pro/i.test(n) && !/image|tts/i.test(n)).slice(0, 8);
+    } else {
+      note = `Saved key, but models list check returned HTTP ${res.status}.`;
+    }
+  } catch (err) {
+    note = `Saved key locally (network check skipped: ${err instanceof Error ? err.message : String(err)})`;
+  }
+
+  return {
+    key_file: KEY_FILE,
+    key_prefix: `${trimmed.slice(0, 6)}...`,
+    verified,
+    available_image_models: imageModels,
+    available_audio_models: audioModels,
+    note,
+  };
 }
 
 function getAudioMimeType(filePath: string): string {
@@ -79,7 +160,7 @@ async function uploadFileToGeminiFileApi(filePath: string, mimeType: string, api
         "X-Goog-Upload-Header-Content-Type": mimeType,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ file: { display_name: filePath.split(/[\\/]/).pop() ?? "audio.mp3" } }),
+      body: JSON.stringify({ file: { display_name: basename(filePath) } }),
     }
   );
 
@@ -108,14 +189,13 @@ async function uploadFileToGeminiFileApi(filePath: string, mimeType: string, api
     throw new Error(`Gemini File API upload finalize failed (${uploadRes.status}): ${errText}`);
   }
 
-  const uploadJson = (await uploadRes.json()) as { file?: { uri?: string; name?: string; state?: string } };
+  const uploadJson = (await uploadRes.json()) as { file?: { uri?: string; name?: string } };
   const fileUri = uploadJson.file?.uri;
   const fileName = uploadJson.file?.name;
   if (!fileUri || !fileName) {
     throw new Error(`Gemini File API returned unexpected payload: ${JSON.stringify(uploadJson)}`);
   }
 
-  // Wait until file state is ACTIVE
   for (let i = 0; i < 30; i++) {
     const checkRes = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/${fileName}?key=${encodeURIComponent(apiKey)}`
@@ -143,22 +223,31 @@ export async function identifyLyricsAndTimestampsWithGemini(
     auto_draft_scenes?: boolean;
     preferred_shot_duration_seconds?: number;
     creative_direction?: string;
+    audio_model?: string;
   } = {}
 ): Promise<{
   lyrics: LyricSegment[];
   drafted_scenes_count: number;
   song_metadata: StoryboardProject["song_metadata"];
+  model_used: string;
 }> {
   const apiKey = getGeminiApiKey();
   if (!apiKey) {
     throw new Error(
-      "Missing GEMINI_API_KEY. Set GEMINI_API_KEY in your environment, save it to ~/.flow-music-mcp/gemini-key, or call the 'gemini_set_api_key' tool."
+      `Missing GEMINI_API_KEY. Ask the user for their Google AI Studio API key (starts with 'AIza' or 'AQ.') and pass it to the 'gemini_set_api_key' tool. Do NOT search the filesystem.`
     );
   }
 
   if (!existsSync(project.mp3_file)) {
     throw new Error(`Audio file not found at ${project.mp3_file}`);
   }
+
+  const cfg = loadRuntimeConfig();
+  const audioModel =
+    options.audio_model ||
+    cfg.gemini_audio_model ||
+    process.env.FLOW_MUSIC_GEMINI_MODEL ||
+    "gemini-2.5-flash";
 
   const mimeType = getAudioMimeType(project.mp3_file);
   const stats = statSync(project.mp3_file);
@@ -272,7 +361,7 @@ Respond strictly with valid JSON matching this structure:
 
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-      GEMINI_AUDIO_MODEL
+      audioModel
     )}:generateContent?key=${encodeURIComponent(apiKey)}`,
     {
       method: "POST",
@@ -294,7 +383,7 @@ Respond strictly with valid JSON matching this structure:
 
   if (!res.ok) {
     const errText = await res.text();
-    throw new Error(`Gemini audio analysis failed (${res.status}): ${errText}`);
+    throw new Error(`Gemini audio analysis failed (${res.status} on ${audioModel}): ${errText}`);
   }
 
   const data = (await res.json()) as {
@@ -403,25 +492,122 @@ Respond strictly with valid JSON matching this structure:
     lyrics,
     drafted_scenes_count: project.scenes.length,
     song_metadata: project.song_metadata,
+    model_used: audioModel,
   };
 }
 
 /**
- * Low-level helper to generate an image via Gemini API (supporting multimodal reference images)
- * with automatic fallback across Gemini native image generation models and Imagen 3.
+ * Browser fallback: When a user's Google AI Studio API key is on the Free Tier (where *-image models
+ * return 429 limit: 0), we can generate the image using the user's signed-in Google Flow Music
+ * (flowmusic.app) Chrome session, where image generation is included with their subscription!
+ */
+async function generateImageViaFlowMusicBrowser(options: {
+  prompt: string;
+  referenceImagePaths?: string[];
+  outputFilePath: string;
+}): Promise<{ savedPath: string; modelUsed: string }> {
+  const page = await getFlowMusicPage();
+
+  // Snapshot existing images on the page (> 180px wide)
+  const beforeImgs = new Set<string>(
+    await page.evaluate(() =>
+      Array.from(document.querySelectorAll("img"))
+        .filter((img) => img.naturalWidth >= 180 || img.width >= 180)
+        .map((img) => img.currentSrc || img.src || "")
+        .filter(Boolean)
+    )
+  );
+
+  // Attach reference image if available via input[type="file"][aria-label="Upload image file"]
+  for (const refPath of options.referenceImagePaths ?? []) {
+    if (refPath && existsSync(refPath)) {
+      const imgInput = page.locator('input[type="file"][aria-label*="image" i]').first();
+      if ((await imgInput.count()) > 0) {
+        await imgInput.setInputFiles(refPath);
+        await page.waitForTimeout(1500);
+      }
+    }
+  }
+
+  const chatBox = page
+    .locator('textarea[aria-label="Chat message"], textarea[placeholder*="create" i], textarea')
+    .first();
+  if ((await chatBox.count()) === 0) {
+    throw new Error(
+      "Could not find chat composer in Google Flow Music browser window for image fallback."
+    );
+  }
+
+  await chatBox.click({ timeout: 5000 });
+  await chatBox.fill(`Generate a still keyframe image: ${options.prompt}`);
+  await page.waitForTimeout(300);
+
+  const sendBtn = page.locator('button[aria-label="Send message"]').first();
+  if ((await sendBtn.count()) > 0 && (await sendBtn.isVisible().catch(() => false))) {
+    await sendBtn.click({ timeout: 4000 });
+  } else {
+    await page.keyboard.press("Enter");
+  }
+
+  // Poll for a new large generated image in the session
+  const deadline = Date.now() + 90_000;
+  while (Date.now() < deadline) {
+    await page.waitForTimeout(2500);
+    const newImgSrc = await page.evaluate((known: string[]) => {
+      const knownSet = new Set(known);
+      const imgs = Array.from(document.querySelectorAll("img")).filter(
+        (img) =>
+          (img.naturalWidth >= 200 || img.width >= 200) &&
+          !img.src.includes("avatar") &&
+          !img.src.includes("logo")
+      );
+      for (const img of imgs.reverse()) {
+        const s = img.currentSrc || img.src || "";
+        if (s && !knownSet.has(s)) return s;
+      }
+      return null;
+    }, Array.from(beforeImgs));
+
+    if (newImgSrc) {
+      const b64 = await page.evaluate(async (srcUrl: string) => {
+        const resp = await fetch(srcUrl, { credentials: "include" });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const buf = await resp.arrayBuffer();
+        let binary = "";
+        const bytes = new Uint8Array(buf);
+        const chunkSize = 0x8000;
+        for (let i = 0; i < bytes.length; i += chunkSize) {
+          binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+        }
+        return btoa(binary);
+      }, newImgSrc);
+
+      if (b64 && b64.length > 100) {
+        writeFileSync(options.outputFilePath, Buffer.from(b64, "base64"));
+        return {
+          savedPath: options.outputFilePath,
+          modelUsed: "flowmusic-browser-nano-banana",
+        };
+      }
+    }
+  }
+
+  throw new Error("Timed out waiting for image generation in Google Flow Music browser fallback.");
+}
+
+/**
+ * Generates an image via Gemini API (supporting multimodal reference images)
+ * using the live 2026 model names + dynamic model discovery + automatic browser fallback if quota is 0.
  */
 export async function callGeminiImageGeneration(options: {
   prompt: string;
   aspectRatio?: string;
   referenceImagePaths?: string[];
   outputFilePath: string;
+  preferredModel?: string;
 }): Promise<{ savedPath: string; modelUsed: string }> {
+  const cfg = loadRuntimeConfig();
   const apiKey = getGeminiApiKey();
-  if (!apiKey) {
-    throw new Error(
-      "Missing GEMINI_API_KEY. Set GEMINI_API_KEY in your environment, save it to ~/.flow-music-mcp/gemini-key, or call 'gemini_set_api_key'."
-    );
-  }
 
   const refParts: Array<{ inlineData: { mimeType: string; data: string } }> = [];
   for (const refPath of options.referenceImagePaths ?? []) {
@@ -437,45 +623,23 @@ export async function callGeminiImageGeneration(options: {
     }
   }
 
+  const modelsToTry = Array.from(
+    new Set(
+      [
+        options.preferredModel,
+        cfg.gemini_image_model,
+        process.env.FLOW_MUSIC_GEMINI_IMAGE_MODEL,
+        ...DEFAULT_GEMINI_IMAGE_MODELS,
+      ].filter((m): m is string => Boolean(m))
+    )
+  );
+
   const errors: string[] = [];
+  let hitFreeTierZeroQuota = false;
 
-  for (const model of GEMINI_IMAGE_MODELS) {
-    try {
-      if (model.startsWith("imagen-")) {
-        // Imagen predict endpoint
-        const res = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-            model
-          )}:predict?key=${encodeURIComponent(apiKey)}`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              instances: [{ prompt: options.prompt }],
-              parameters: {
-                sampleCount: 1,
-                aspectRatio: options.aspectRatio || "16:9",
-              },
-            }),
-          }
-        );
-
-        if (!res.ok) {
-          errors.push(`${model}: HTTP ${res.status} ${await res.text()}`);
-          continue;
-        }
-
-        const data = (await res.json()) as {
-          predictions?: Array<{ bytesBase64Encoded?: string }>;
-        };
-        const b64 = data.predictions?.[0]?.bytesBase64Encoded;
-        if (b64) {
-          writeFileSync(options.outputFilePath, Buffer.from(b64, "base64"));
-          return { savedPath: options.outputFilePath, modelUsed: model };
-        }
-        errors.push(`${model}: No bytesBase64Encoded in response`);
-      } else {
-        // Gemini multimodal generateContent endpoint with responseModalities: ["TEXT", "IMAGE"]
+  if (apiKey && !cfg.prefer_browser_image_generation) {
+    for (const model of modelsToTry) {
+      try {
         const promptWithRefs =
           refParts.length > 0
             ? `Maintain strict visual consistency with the attached character/style reference image(s). Aspect ratio: ${
@@ -505,7 +669,13 @@ export async function callGeminiImageGeneration(options: {
         );
 
         if (!res.ok) {
-          errors.push(`${model}: HTTP ${res.status} ${await res.text()}`);
+          const errText = await res.text();
+          errors.push(`${model}: HTTP ${res.status} ${errText.slice(0, 220)}`);
+          if (res.status === 429 && /free_tier_requests|limit:\s*0|RESOURCE_EXHAUSTED/i.test(errText)) {
+            hitFreeTierZeroQuota = true;
+            // All free-tier image models share limit: 0 on an unbilled AI Studio key, so break early to browser fallback
+            break;
+          }
           continue;
         }
 
@@ -527,13 +697,30 @@ export async function callGeminiImageGeneration(options: {
           return { savedPath: options.outputFilePath, modelUsed: model };
         }
         errors.push(`${model}: Response did not include inlineData image`);
+      } catch (err) {
+        errors.push(`${model}: ${err instanceof Error ? err.message : String(err)}`);
       }
-    } catch (err) {
-      errors.push(`${model}: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
-  throw new Error(`All Gemini image generation models failed:\n- ${errors.join("\n- ")}`);
+  // If the Gemini API key hit Free-Tier limit: 0 (HTTP 429) or prefer_browser_image_generation is set,
+  // automatically try generating the image inside the user's signed-in Google Flow Music browser!
+  try {
+    return await generateImageViaFlowMusicBrowser({
+      prompt: options.prompt,
+      referenceImagePaths: options.referenceImagePaths,
+      outputFilePath: options.outputFilePath,
+    });
+  } catch (browserErr) {
+    const quotaExplanation = hitFreeTierZeroQuota
+      ? `\n\nIMPORTANT ROOT CAUSE: Your Google AI Studio API key is currently on the Free Tier where image generation models ('gemini-3.1-flash-image', 'gemini-2.5-flash-image', 'gemini-nano-banana-2.1') have 'free_tier_requests limit: 0' unless Cloud Billing is linked at https://aistudio.google.com/api-keys (notice the 'No API key selected / paid-api-key-button' in AI Studio). Do NOT restart Claude or change environment variables—either enable billing on the key in Google AI Studio OR keep the Google Flow Music Chrome window open so browser image generation can run.`
+      : "";
+    throw new Error(
+      `Image generation failed.\nAPI Attempts:\n- ${errors.join("\n- ")}\nBrowser Fallback: ${
+        browserErr instanceof Error ? browserErr.message : String(browserErr)
+      }${quotaExplanation}`
+    );
+  }
 }
 
 /**
@@ -546,6 +733,7 @@ export async function generateCharacterImageWithGemini(
     outfit_id?: string;
     custom_prompt_override?: string;
     reference_image_path?: string;
+    image_model?: string;
   }
 ): Promise<{
   character_id: string;
@@ -603,7 +791,6 @@ export async function generateCharacterImageWithGemini(
   const fileSlug = outfit ? `${char.id}_${outfit.id}.png` : `${char.id}.png`;
   const outputPath = join(project.folder_path, "characters", fileSlug);
 
-  // If generating a secondary outfit and primary_image_path already exists, pass it as a reference so the character's face/proportions stay locked!
   const refImages: string[] = [];
   if (options.reference_image_path && existsSync(options.reference_image_path)) {
     refImages.push(options.reference_image_path);
@@ -616,6 +803,7 @@ export async function generateCharacterImageWithGemini(
     aspectRatio: project.aspect_ratio,
     referenceImagePaths: refImages,
     outputFilePath: outputPath,
+    preferredModel: options.image_model,
   });
 
   if (outfit) {
@@ -645,6 +833,7 @@ export async function generateSceneImageWithGemini(
     custom_prompt_override?: string;
     force_even_if_uses_last_frame?: boolean;
     include_previous_scene_image_as_reference?: boolean;
+    image_model?: string;
   }
 ): Promise<{
   shot_number: number;
@@ -679,7 +868,6 @@ export async function generateSceneImageWithGemini(
     scene.compiled_image_prompt ||
     `${project.style_anchor}. ${scene.keyframe_specification}`;
 
-  // Collect character reference images for all characters appearing in this shot
   const refImages: string[] = [];
   for (const charId of scene.character_ids) {
     const char = project.characters.find(
@@ -689,17 +877,23 @@ export async function generateSceneImageWithGemini(
       const outfit = scene.outfit_id
         ? char.outfits.find((o) => o.id === scene.outfit_id || o.name === scene.outfit_id)
         : undefined;
-      const candidatePath = outfit?.image_path || char.primary_image_path || char.outfits.find((o) => o.image_path)?.image_path;
+      const candidatePath =
+        outfit?.image_path ||
+        char.primary_image_path ||
+        char.outfits.find((o) => o.image_path)?.image_path;
       if (candidatePath && existsSync(candidatePath) && !refImages.includes(candidatePath)) {
         refImages.push(candidatePath);
       }
     }
   }
 
-  // Optionally attach previous scene's image for visual continuity
   if (options.include_previous_scene_image_as_reference && scene.shot_number > 1) {
     const prevScene = project.scenes.find((s) => s.shot_number === scene.shot_number - 1);
-    if (prevScene?.image_path && existsSync(prevScene.image_path) && !refImages.includes(prevScene.image_path)) {
+    if (
+      prevScene?.image_path &&
+      existsSync(prevScene.image_path) &&
+      !refImages.includes(prevScene.image_path)
+    ) {
       refImages.push(prevScene.image_path);
     }
   }
@@ -710,6 +904,7 @@ export async function generateSceneImageWithGemini(
     aspectRatio: project.aspect_ratio,
     referenceImagePaths: refImages,
     outputFilePath: outputPath,
+    preferredModel: options.image_model,
   });
 
   scene.image_path = savedPath;

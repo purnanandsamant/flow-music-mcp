@@ -8,36 +8,56 @@ import {
   getFlowMusicPage,
   waitForDownloadedFile,
 } from "./chrome.js";
+import { getGeminiApiKey, KEY_FILE } from "./gemini.js";
 import { saveProject } from "./storyboard.js";
-import type { SceneShot, StoryboardProject } from "./types.js";
+import type { StoryboardProject } from "./types.js";
+
+export const PLAYBOOK = {
+  critical_rules: [
+    "NEVER run bash/PowerShell searches to hunt for flow-music-mcp config files or API keys on the filesystem. Everything is managed directly through these MCP tools.",
+    "Valid Google AI Studio keys start with EITHER 'AIza' OR 'AQ.' (2026 format). Accept 'AQ.' keys immediately via 'gemini_set_api_key' without questioning the user.",
+    "You NEVER need to restart Claude to apply a new API key or image model. All keys and models are read dynamically on every call.",
+    "If the user's Gemini API key is on the Free Tier (where image models have limit: 0), 'gemini_generate_character_image' and 'gemini_generate_scene_images' automatically fall back to generating the images inside the signed-in Google Flow Music Chrome window.",
+  ],
+  workflow_steps: [
+    "1. Call 'project_connect' (or 'music_identify_lyrics' directly with folder_path) to connect to the user's MP3 song folder and extract timestamped lyrics & initial sub-10s scenes.",
+    "2. Show the lyrics and sub-10s scenes (including each scene's frame_mode: 'generate_start_frame' vs 'use_previous_last_frame') to the user for review/editing ('storyboard_edit_scene').",
+    "3. Define characters ('storyboard_upsert_character') and generate character sheets ('gemini_generate_character_image'), then generate scene starting keyframes ('gemini_generate_scene_images').",
+    "4. Once scene images are approved, call 'flow_music_new_session' and 'flow_music_generate_videos' to initiate the storyboard in Google Flow Music (flowmusic.app) and download all MP4 scene clips.",
+  ],
+};
 
 export interface FlowMusicStatus {
   connected: boolean;
   url: string;
   title: string;
   signed_in: boolean;
+  account_or_plan?: string;
+  gemini_api_key_configured: boolean;
+  gemini_key_file: string;
   login_hint?: string;
-  credits_or_plan_text?: string;
   active_composer_found: boolean;
   visible_buttons: string[];
   visible_video_count: number;
+  playbook: typeof PLAYBOOK;
 }
 
 async function findVisibleComposer(page: Page): Promise<Locator | null> {
+  // Exact live selector on flowmusic.app first: textarea[aria-label="Chat message"]
   const selectors = [
+    'textarea[aria-label="Chat message"]',
+    'textarea[placeholder*="Let\'s create" i]',
     '.ProseMirror[contenteditable="true"]',
     '[role="textbox"][contenteditable="true"]',
     'textarea[placeholder*="video" i]',
     'textarea[placeholder*="describe" i]',
     'textarea[placeholder*="prompt" i]',
-    'textarea[placeholder*="ask" i]',
-    'textarea[placeholder*="music" i]',
     "textarea",
     '[contenteditable="true"]',
   ];
 
   for (const sel of selectors) {
-    const loc = page.locator(sel).last();
+    const loc = page.locator(sel).first();
     if ((await loc.count()) > 0 && (await loc.isVisible().catch(() => false))) {
       return loc;
     }
@@ -51,7 +71,8 @@ export async function getFlowMusicStatus(): Promise<FlowMusicStatus> {
   const title = await page.title().catch(() => "");
 
   const evalData = await page.evaluate(() => {
-    const visibleText = (el: Element): string => (el as HTMLElement).innerText?.trim() || el.getAttribute("aria-label") || "";
+    const visibleText = (el: Element): string =>
+      (el as HTMLElement).innerText?.trim() || el.getAttribute("aria-label") || "";
     const isVis = (el: Element): boolean => {
       const r = el.getBoundingClientRect();
       const s = window.getComputedStyle(el);
@@ -67,14 +88,19 @@ export async function getFlowMusicStatus(): Promise<FlowMusicStatus> {
       /^(log\s*in|sign\s*in|continue with google)$/i.test(b.trim())
     );
 
+    const settingsBtn = document.querySelector('button[aria-label="Settings menu"]') as HTMLElement | null;
+    const accountText = settingsBtn?.innerText?.replace(/\s+/g, " ").trim();
+
     const bodyText = document.body?.innerText || "";
-    const creditMatch = bodyText.match(/(\d[\d,]*\s*credits?|\b(?:Pro|Ultra|Free|Google One)\b\s*plan)/i);
+    const creditMatch = bodyText.match(
+      /(\d[\d,]*\s*credits?|\b(?:PLUS|PRO|Ultra|Free|Google One)\b)/i
+    );
     const videos = Array.from(document.querySelectorAll("video")).filter(isVis).length;
 
     return {
       buttons: Array.from(new Set(buttons)).slice(0, 40),
       hasSignInButton,
-      creditText: creditMatch ? creditMatch[0] : undefined,
+      accountOrPlan: accountText || (creditMatch ? creditMatch[0] : undefined),
       videos,
     };
   });
@@ -90,13 +116,16 @@ export async function getFlowMusicStatus(): Promise<FlowMusicStatus> {
     url,
     title,
     signed_in: signedIn,
+    account_or_plan: evalData.accountOrPlan,
+    gemini_api_key_configured: Boolean(getGeminiApiKey()),
+    gemini_key_file: KEY_FILE,
     login_hint: signedIn
       ? undefined
       : "You are not signed in to Google Flow Music yet. Run 'flow_music_login' (or 'npm run login'), click 'Login -> Continue with Google' in the Chrome window, and check the box for Google One AI benefits.",
-    credits_or_plan_text: evalData.creditText,
     active_composer_found: Boolean(composer),
     visible_buttons: evalData.buttons,
     visible_video_count: evalData.videos,
+    playbook: PLAYBOOK,
   };
 }
 
@@ -199,9 +228,10 @@ async function clickByTextOrLabel(page: Page, patterns: RegExp[], timeoutMs: num
 
 /**
  * Uploads an audio (.mp3) or image (.png) reference into the Google Flow Music composer.
- * Follows the Google Flow Music Help workflow:
- * - Click "Add" (or "+" / "Add media") at the bottom-left of the prompt box -> select "Audio" or "Image"
- * - Or fallback to setting file input directly.
+ * Uses the exact live selectors mapped from flowmusic.app:
+ * - input[type="file"][aria-label="Upload audio file"]
+ * - input[type="file"][aria-label="Upload image file"]
+ * - button[aria-label="Add audio or image"]
  */
 export async function attachMediaToFlowMusic(
   page: Page,
@@ -212,14 +242,26 @@ export async function attachMediaToFlowMusic(
     throw new Error(`File to upload does not exist: ${filePath}`);
   }
 
-  // Strategy 1: Click "Add" / "+" button then click "Audio" or "Image" (or "Upload") with filechooser listener
+  // Strategy 1 (Primary on flowmusic.app): Direct hidden file input by exact aria-label
+  const exactAriaSelector =
+    mediaType === "audio"
+      ? 'input[type="file"][aria-label="Upload audio file"], input[type="file"][aria-label*="audio" i]'
+      : 'input[type="file"][aria-label="Upload image file"], input[type="file"][aria-label*="image" i]';
+
+  const exactInput = page.locator(exactAriaSelector).first();
+  if ((await exactInput.count()) > 0) {
+    await exactInput.setInputFiles(filePath);
+    await page.waitForTimeout(2000);
+    return { uploaded: true, method: `input[aria-label="Upload ${mediaType} file"]` };
+  }
+
+  // Strategy 2: Click button[aria-label="Add audio or image"] or "Add" -> "Audio" / "Image"
   const addButtons = [
+    /add\s+audio\s+or\s+image/i,
     /^add$/i,
     /add\s+media/i,
     /add\s+to\s+prompt/i,
-    /add\s+ingredients/i,
     /attach/i,
-    /^\+$/,
   ];
 
   const openedMenu = await clickByTextOrLabel(page, addButtons, 3000);
@@ -239,23 +281,11 @@ export async function attachMediaToFlowMusic(
       await page.waitForTimeout(2000);
       return { uploaded: true, method: `Add -> ${mediaType} menu filechooser` };
     } catch {
-      // If clicking "Add" directly opened a filechooser or didn't match submenu, fall through
+      // Fall through
     }
   }
 
-  // Strategy 2: Direct file input element in DOM
-  const acceptSelector =
-    mediaType === "audio"
-      ? 'input[type="file"][accept*="audio" i], input[type="file"][accept*=".mp3" i]'
-      : 'input[type="file"][accept*="image" i], input[type="file"][accept*=".png" i]';
-
-  const specificInput = page.locator(acceptSelector).first();
-  if ((await specificInput.count()) > 0) {
-    await specificInput.setInputFiles(filePath);
-    await page.waitForTimeout(2000);
-    return { uploaded: true, method: `direct input[type=file] (${mediaType})` };
-  }
-
+  // Strategy 3: Generic file input fallback
   const anyFileInput = page.locator('input[type="file"]').first();
   if ((await anyFileInput.count()) > 0) {
     await anyFileInput.setInputFiles(filePath);
@@ -268,10 +298,14 @@ export async function attachMediaToFlowMusic(
 
 /**
  * Selects the video generation model in Google Flow Music:
- * Click Settings -> Video Generation -> Select your model
+ * Click button[aria-label="Chat settings"] / Settings -> Video Generation -> Select your model
  */
 export async function selectFlowMusicVideoModel(page: Page, modelName: string): Promise<boolean> {
-  const clickedSettings = await clickByTextOrLabel(page, [/settings/i, /model/i], 3000);
+  const clickedSettings = await clickByTextOrLabel(
+    page,
+    [/chat\s*settings/i, /^settings$/i, /model/i],
+    3000
+  );
   if (!clickedSettings) return false;
   await page.waitForTimeout(400);
 
@@ -285,8 +319,8 @@ export async function selectFlowMusicVideoModel(page: Page, modelName: string): 
 }
 
 /**
- * Types a prompt into the active Google Flow Music composer and submits it
- * (clicks "Make the video", "Start generation", "Generate", "Send", or presses Enter).
+ * Types a prompt into the active Google Flow Music composer (textarea[aria-label="Chat message"])
+ * and submits it via button[aria-label="Send message"] or "Make the video".
  */
 export async function submitPromptInFlowMusic(
   page: Page,
@@ -301,7 +335,6 @@ export async function submitPromptInFlowMusic(
   }
 
   await composer.click({ timeout: 5000 });
-  // Clear existing text safely
   await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A").catch(() => {});
   await page.keyboard.press("Backspace").catch(() => {});
 
@@ -310,19 +343,25 @@ export async function submitPromptInFlowMusic(
   });
   await page.waitForTimeout(400);
 
+  // Check exact aria-label="Send message" button first or "Make the video"
+  const sendMsgBtn = page.locator('button[aria-label="Send message"]').first();
+  if ((await sendMsgBtn.count()) > 0 && (await sendMsgBtn.isVisible().catch(() => false)) && (await sendMsgBtn.isEnabled().catch(() => true))) {
+    await sendMsgBtn.click({ timeout: 4000 });
+    return { submitted: true, button_clicked: 'button[aria-label="Send message"]' };
+  }
+
   const submitPatterns =
     submitMode === "make_video"
       ? [
           /make\s+the\s+video/i,
           /make\s+video/i,
+          /send\s+message/i,
           /create\s+video/i,
           /start\s+generation/i,
           /^generate$/i,
-          /^create$/i,
           /^send$/i,
-          /submit/i,
         ]
-      : [/^send$/i, /submit/i, /make\s+the\s+video/i, /start\s+generation/i, /^generate$/i];
+      : [/send\s+message/i, /^send$/i, /submit/i, /make\s+the\s+video/i, /^generate$/i];
 
   for (const pat of submitPatterns) {
     try {
@@ -336,7 +375,6 @@ export async function submitPromptInFlowMusic(
     }
   }
 
-  // Fallback: press Enter
   await page.keyboard.press("Enter");
   return { submitted: true, button_clicked: "Enter_key" };
 }
@@ -368,21 +406,28 @@ export async function startNewFlowMusicSession(
     );
   }
 
-  const mode = options.workflow_mode ?? "music_video";
+  const mode = options.workflow_mode ?? "session";
 
-  if (!/flowmusic\.app|flow\.google\.com/i.test(page.url())) {
+  if (!/flowmusic\.app/i.test(page.url())) {
     await page.goto(FLOW_MUSIC_URL, { waitUntil: "domcontentloaded", timeout: 45_000 });
     await page.waitForTimeout(2000);
   }
 
   if (mode === "music_video") {
-    // Follow Google Flow Music Help: On the left, select "Music videos" -> "New music video"
-    await clickByTextOrLabel(page, [/^music\s*videos$/i, /music\s*video/i], 4000);
-    await page.waitForTimeout(1000);
-    await clickByTextOrLabel(page, [/new\s*music\s*video/i, /create\s*music\s*video/i, /^new$/i], 4000);
+    // Try clicking "Make video" chip or navigating to /session / /library/videos
+    const clickedMakeVideo = await clickByTextOrLabel(
+      page,
+      [/^make\s*video$/i, /new\s*music\s*video/i, /^new\s*session$/i],
+      3500
+    );
+    if (!clickedMakeVideo) {
+      await page.goto("https://www.flowmusic.app/session", {
+        waitUntil: "domcontentloaded",
+        timeout: 30_000,
+      });
+    }
     await page.waitForTimeout(1500);
   } else if (mode === "project") {
-    // On the left, select Projects -> New project
     await clickByTextOrLabel(page, [/^projects$/i], 4000);
     await page.waitForTimeout(800);
     await clickByTextOrLabel(page, [/new\s*project/i], 4000);
@@ -394,8 +439,13 @@ export async function startNewFlowMusicSession(
       await page.waitForTimeout(1500);
     }
   } else {
-    // Start a new producer session
-    await clickByTextOrLabel(page, [/new\s*session/i, /^sessions$/i, /start\s*new/i], 4000);
+    const clickedNewSession = await clickByTextOrLabel(page, [/^new\s*session$/i], 3500);
+    if (!clickedNewSession) {
+      await page.goto("https://www.flowmusic.app/session", {
+        waitUntil: "domcontentloaded",
+        timeout: 30_000,
+      });
+    }
     await page.waitForTimeout(1500);
   }
 
@@ -461,10 +511,8 @@ async function waitForAndDownloadNewVideo(
     }, Array.from(beforeVideoSources));
 
     if (state.newVideoSrc) {
-      // Wait briefly for video stream/file to finalize
       await page.waitForTimeout(2000);
 
-      // Method 1: Try clicking the Download button inside Google Flow Music
       mkdirSync(DOWNLOADS_DIR, { recursive: true });
       const beforeDownloads = new Set(readdirSync(DOWNLOADS_DIR));
       const clickedDownload = await clickByTextOrLabel(
@@ -482,7 +530,6 @@ async function waitForAndDownloadNewVideo(
         }
       }
 
-      // Method 2: Fetch the video bytes directly inside the authenticated page context if http(s) or blob:
       try {
         const b64 = await page.evaluate(async (srcUrl: string) => {
           const resp = await fetch(srcUrl, { credentials: "include" });
@@ -565,7 +612,6 @@ export async function generateStoryboardVideosInFlowMusic(
     throw new Error("No matching scenes found in the storyboard to generate.");
   }
 
-  // Optional: Send the master storyboard overview to the session first
   if (options.initiate_session_overview_first && !project.flow_music_session.storyboard_initiated) {
     const overviewLines = [
       `We are creating a cohesive Music Video Storyboard for "${project.song_metadata.title || project.project_name}".`,
@@ -574,7 +620,7 @@ export async function generateStoryboardVideosInFlowMusic(
         ? `Character Lock: ${project.characters.map((c) => `${c.name} (${c.anchor_prompt})`).join(" | ")}`
         : "",
       `Total Shots: ${project.scenes.length} sub-10-second timestamped scenes synced to the lyrics.`,
-      `Please lock this visual style and character consistency across the upcoming scene generations.`,
+      `Please lock this visual style and character consistency across the upcoming scene video generations.`,
     ].filter(Boolean);
 
     await submitPromptInFlowMusic(page, overviewLines.join("\n"), "chat");
@@ -600,7 +646,6 @@ export async function generateStoryboardVideosInFlowMusic(
     scene.video_status = "generating";
     saveProject(project);
 
-    // Snapshot existing video sources before starting this scene
     const beforeSrcs = new Set<string>(
       await page.evaluate(() =>
         Array.from(document.querySelectorAll("video"))
@@ -622,7 +667,6 @@ export async function generateStoryboardVideosInFlowMusic(
         }
       }
     } else if (scene.frame_mode === "use_previous_last_frame") {
-      // Find the previous scene's generated video and extract its exact final frame!
       const prevScene = project.scenes.find((s) => s.shot_number === scene.shot_number - 1);
       const prevVideoPath =
         prevScene?.video_path ||
@@ -639,7 +683,7 @@ export async function generateStoryboardVideosInFlowMusic(
           imageToAttach = extractedLastFramePng;
           scene.image_path = extractedLastFramePng;
         } catch {
-          // If extraction fails, rely on Flow Music's continuation instruction in the prompt
+          // Fallback to prompt instruction
         }
       }
     }
@@ -650,7 +694,7 @@ export async function generateStoryboardVideosInFlowMusic(
 
     const videoPrompt =
       scene.compiled_video_prompt ||
-      `[${scene.start_time}-${scene.end_time}] ${project.style_anchor}. ${scene.camera_and_action}. ${scene.keyframe_specification}`;
+      `Make video for Shot ${scene.shot_number} [${scene.start_time}-${scene.end_time}]: ${project.style_anchor}. ${scene.camera_and_action}. ${scene.keyframe_specification}`;
 
     await submitPromptInFlowMusic(page, videoPrompt, "make_video");
 

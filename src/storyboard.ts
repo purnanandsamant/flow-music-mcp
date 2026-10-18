@@ -436,7 +436,8 @@ export function saveProject(project: StoryboardProject): StoryboardProject {
 }
 
 export function loadProject(folderPath?: string): StoryboardProject {
-  const targetFolder = resolve(folderPath ?? activeFolderPath ?? "");
+  const candidateFolder = folderPath || activeFolderPath || process.cwd();
+  const targetFolder = resolve(candidateFolder);
   if (!targetFolder || !existsSync(targetFolder)) {
     throw new Error(
       `No valid project folder connected. Call 'project_connect' with the folder path containing your MP3 first.`
@@ -445,8 +446,12 @@ export function loadProject(folderPath?: string): StoryboardProject {
   setActiveFolderPath(targetFolder);
   const { jsonPath, mdPath } = ensureProjectDirs(targetFolder);
   if (!existsSync(jsonPath)) {
+    const audioFiles = findMp3Files(targetFolder);
+    if (audioFiles.length > 0) {
+      return connectProjectFolder({ folder_path: targetFolder }).project;
+    }
     throw new Error(
-      `No storyboard.json found in ${targetFolder}. Call 'project_connect' with folder_path="${targetFolder}" first.`
+      `No storyboard.json or audio file (.mp3/.wav/.m4a) found in ${targetFolder}. Call 'project_connect' with folder_path pointing to the folder containing your MP3.`
     );
   }
 

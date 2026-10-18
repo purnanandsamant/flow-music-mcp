@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
+import { setDefaultResultOrder } from "node:dns";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -10,14 +11,18 @@ import {
   generateStoryboardVideosInFlowMusic,
   getFlowMusicStatus,
   interactWithFlowMusicPage,
+  PLAYBOOK,
   startNewFlowMusicSession,
 } from "./flow-music.js";
 import {
+  DEFAULT_GEMINI_IMAGE_MODELS,
   generateCharacterImageWithGemini,
   generateSceneImageWithGemini,
   getGeminiApiKey,
   identifyLyricsAndTimestampsWithGemini,
-  saveGeminiApiKey,
+  KEY_FILE,
+  saveAndVerifyGeminiApiKey,
+  saveRuntimeConfig,
 } from "./gemini.js";
 import {
   connectProjectFolder,
@@ -25,7 +30,6 @@ import {
   getActiveFolderPath,
   loadProject,
   parseTimestampToSeconds,
-  refreshAllScenePrompts,
   renderStoryboardMarkdown,
   saveProject,
 } from "./storyboard.js";
@@ -36,9 +40,15 @@ import {
   type SceneShot,
 } from "./types.js";
 
+try {
+  setDefaultResultOrder("ipv4first");
+} catch {
+  // Ignore
+}
+
 const server = new McpServer({
   name: "flow-music-mcp",
-  version: "1.0.0",
+  version: "1.1.0",
 });
 
 type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
@@ -60,7 +70,11 @@ const reply = async (work: Promise<unknown>): Promise<ToolResult> => {
         {
           type: "text",
           text: JSON.stringify(
-            { error: err instanceof Error ? err.message : String(err) },
+            {
+              error: err instanceof Error ? err.message : String(err),
+              important_rule:
+                "Do NOT run background shell searches on the filesystem or ask the user to restart Claude. Use the MCP tools directly.",
+            },
             null,
             2
           ),
@@ -71,8 +85,6 @@ const reply = async (work: Promise<unknown>): Promise<ToolResult> => {
   }
 };
 
-// Non-blocking task ticket manager so long-running Gemini image batches or Google Flow Music
-// video generations never hit Claude's 60-second MCP tool timeout.
 const PATIENCE_MS = Number(process.env.FLOW_MUSIC_PATIENCE_MS ?? 45_000);
 
 interface BackgroundTask {
@@ -134,7 +146,7 @@ server.registerTool(
   {
     title: "Connect to MP3 Project Folder",
     description:
-      "Step 0: Connect to a local folder where an MP3 (or WAV/M4A) is placed. Initializes or loads storyboard.json, STORYBOARD.md, and creates characters/, scenes/, and videos/ subfolders.",
+      "Step 0: Connect to a local folder where an MP3 (or WAV/M4A) is placed. Initializes or loads storyboard.json, STORYBOARD.md, and creates characters/, scenes/, and videos/ subfolders. Never search the filesystem for config files; call this tool directly.",
     inputSchema: {
       folder_path: z.string().describe("Absolute path to the folder containing the MP3 file"),
       mp3_filename: z
@@ -164,6 +176,7 @@ server.registerTool(
           mp3_duration_seconds: res.project.mp3_duration_seconds,
           available_audio_files: res.available_audio_files,
           gemini_api_key_configured: Boolean(getGeminiApiKey()),
+          gemini_key_file: KEY_FILE,
           lyrics_segments_count: res.project.lyrics.length,
           characters_count: res.project.characters.length,
           scenes_count: res.project.scenes.length,
@@ -171,6 +184,7 @@ server.registerTool(
             json: join(res.project.folder_path, "storyboard.json"),
             markdown: join(res.project.folder_path, "STORYBOARD.md"),
           },
+          playbook: PLAYBOOK,
           next_step:
             res.project.lyrics.length === 0
               ? "Call 'music_identify_lyrics' to analyze the MP3 with Gemini and extract lyrics + timestamps."
@@ -183,21 +197,44 @@ server.registerTool(
 server.registerTool(
   "gemini_set_api_key",
   {
-    title: "Set Gemini API Key",
+    title: "Set Gemini API Key & Optional Model Preferences",
     description:
-      "Save a Google AI Studio / Gemini API key to ~/.flow-music-mcp/gemini-key so Gemini can analyze MP3 audio and generate character/scene images.",
+      "Save a Google AI Studio / Gemini API key to ~/.flow-music-mcp/gemini-key (no restart needed). IMPORTANT: Valid Google AI Studio keys start with EITHER 'AIza' (older format) OR 'AQ.' (newer 2026 format). Accept 'AQ.' keys immediately without questioning the user.",
     inputSchema: {
-      api_key: z.string().describe("Your Gemini API key from Google AI Studio"),
+      api_key: z
+        .string()
+        .describe("Your Gemini API key from Google AI Studio (starts with 'AIza...' or 'AQ....')"),
+      gemini_image_model: z
+        .string()
+        .optional()
+        .describe(
+          "Optional preferred Gemini image model (e.g. 'gemini-3.1-flash-image', 'gemini-nano-banana-2.1', 'gemini-2.5-flash-image')"
+        ),
+      prefer_browser_image_generation: z
+        .boolean()
+        .optional()
+        .describe(
+          "If true, generates character and scene images directly through the signed-in Google Flow Music Chrome window instead of the REST API"
+        ),
     },
   },
-  ({ api_key }) =>
+  (args) =>
     reply(
       (async () => {
-        const savedAt = saveGeminiApiKey(api_key);
+        const res = await saveAndVerifyGeminiApiKey(args.api_key);
+        if (
+          args.gemini_image_model !== undefined ||
+          args.prefer_browser_image_generation !== undefined
+        ) {
+          saveRuntimeConfig({
+            gemini_image_model: args.gemini_image_model,
+            prefer_browser_image_generation: args.prefer_browser_image_generation,
+          });
+        }
         return {
           configured: true,
-          key_file: savedAt,
-          note: "Gemini API key saved securely.",
+          ...res,
+          note: "Gemini API key saved and active immediately (no restart required).",
         };
       })()
     )
@@ -208,13 +245,18 @@ server.registerTool(
   {
     title: "Identify Lyrics & Timestamps from MP3 (Gemini Audio)",
     description:
-      "Step 1 & 2: Uses Gemini multimodal audio analysis on the MP3 in the connected folder to identify exact lyrics, MM:SS timestamps, song sections (Intro, Verse, Chorus, Bridge, Outro), mood/BPM, and optionally drafts initial sub-10-second storyboard scenes with frame_mode ('generate_start_frame' vs 'use_previous_last_frame').",
+      "Step 1 & 2: Uses Gemini multimodal audio analysis on the MP3 in the folder to identify exact lyrics, MM:SS timestamps, song sections (Intro, Verse, Chorus, Bridge, Outro), mood/BPM, and optionally drafts initial sub-10-second storyboard scenes with frame_mode ('generate_start_frame' vs 'use_previous_last_frame'). Automatically connects to folder_path if not connected yet.",
     inputSchema: {
-      folder_path: z.string().optional().describe("Project folder path (optional if already connected)"),
+      folder_path: z
+        .string()
+        .optional()
+        .describe("Path to the folder containing the MP3 file (optional if already connected)"),
       auto_draft_scenes: z
         .boolean()
         .default(true)
-        .describe("If true, Gemini also proposes an initial sub-10-second scene breakdown, characters, and settings"),
+        .describe(
+          "If true, Gemini also proposes an initial sub-10-second scene breakdown, characters, and settings"
+        ),
       preferred_shot_duration_seconds: z
         .number()
         .min(4)
@@ -241,6 +283,7 @@ server.registerTool(
           saveProject(project);
           return {
             song_metadata: result.song_metadata,
+            model_used: result.model_used,
             lyrics_count: result.lyrics.length,
             lyrics: result.lyrics,
             drafted_characters: project.characters,
@@ -542,7 +585,6 @@ server.registerTool(
           };
         }
 
-        // Update existing scene
         const scene = project.scenes.find((s) => s.shot_number === args.shot_number);
         if (!scene) {
           throw new Error(`Shot ${args.shot_number} not found.`);
@@ -606,7 +648,7 @@ server.registerTool(
   {
     title: "Generate Character Model Sheet Image with Gemini",
     description:
-      "Step 4a: Generate a character reference sheet (or specific outfit sheet) using Gemini Image Generation and save it to <folder>/characters/. If generating a secondary outfit, automatically passes the primary character portrait as a visual reference so the character's face and proportions stay locked.",
+      `Step 4a: Generate a character reference sheet (or specific outfit sheet) using Gemini Image Generation (defaults: ${DEFAULT_GEMINI_IMAGE_MODELS.slice(0, 3).join(", ")}; automatically falls back to the signed-in Google Flow Music Chrome session if the API key is on the Free Tier) and save it to <folder>/characters/. No app restart is ever required.`,
     inputSchema: {
       folder_path: z.string().optional(),
       character_id: z.string().describe("Character ID, e.g. 'leo'"),
@@ -619,6 +661,12 @@ server.registerTool(
         .string()
         .optional()
         .describe("Optional path to an existing reference image to lock appearance"),
+      image_model: z
+        .string()
+        .optional()
+        .describe(
+          "Optional model override (e.g. 'gemini-3.1-flash-image', 'gemini-nano-banana-2.1', 'gemini-2.5-flash-image')"
+        ),
     },
   },
   (args) =>
@@ -640,7 +688,7 @@ server.registerTool(
   {
     title: "Generate Scene Keyframe Images with Gemini",
     description:
-      "Step 4b: Generate starting frame images (<folder>/scenes/shot-NN.png) using Gemini Image Generation for all (or selected) storyboard scenes with frame_mode='generate_start_frame'. Automatically passes the locked character reference image(s) from <folder>/characters/ into Gemini so character appearance stays consistent across every scene.",
+      "Step 4b: Generate starting frame images (<folder>/scenes/shot-NN.png) using Gemini Image Generation for all (or selected) storyboard scenes with frame_mode='generate_start_frame'. Automatically passes the locked character reference image(s) from <folder>/characters/ into Gemini (and falls back to the signed-in Google Flow Music Chrome session if the API key is on the Free Tier).",
     inputSchema: {
       folder_path: z.string().optional(),
       shot_numbers: z
@@ -659,6 +707,12 @@ server.registerTool(
         .boolean()
         .default(false)
         .describe("If true, also attaches the previous shot's image as a visual continuity reference"),
+      image_model: z
+        .string()
+        .optional()
+        .describe(
+          "Optional model override (e.g. 'gemini-3.1-flash-image', 'gemini-nano-banana-2.1', 'gemini-2.5-flash-image')"
+        ),
     },
   },
   (args) =>
@@ -682,6 +736,7 @@ server.registerTool(
               force_even_if_uses_last_frame: args.force_even_if_uses_last_frame,
               include_previous_scene_image_as_reference:
                 args.include_previous_scene_image_as_reference,
+              image_model: args.image_model,
             });
             saveProject(project);
             results.push(r);
@@ -731,7 +786,7 @@ server.registerTool(
   {
     title: "Check Google Flow Music Session & Login Status",
     description:
-      "Checks the dedicated Google Flow Music Chrome window (signed in status, current URL, visible controls, credit/plan badge, and active background tasks).",
+      "Checks the dedicated Google Flow Music Chrome window (signed in status, current URL, visible controls, credit/plan badge, Gemini API key status, and active background tasks) and returns the PLAYBOOK.",
     inputSchema: {},
   },
   () =>
@@ -752,21 +807,21 @@ server.registerTool(
   {
     title: "Start a New Google Flow Music Session / Music Video",
     description:
-      "Step 5a: Initiates a new Music Video ('Music videos -> New music video') or Producer Session in Google Flow Music (https://www.flowmusic.app/), attaches the project's MP3 audio ('Add -> Audio'), and optionally selects the video generation model ('Settings -> Video Generation').",
+      "Step 5a: Initiates a new Session or Music Video in Google Flow Music (https://www.flowmusic.app/), attaches the project's MP3 audio ('Upload audio file'), and optionally selects the video generation model ('Chat settings -> Video Generation').",
     inputSchema: {
       folder_path: z.string().optional(),
       workflow_mode: z
         .enum(["music_video", "session", "project"])
-        .default("music_video")
-        .describe("Open 'Music videos -> New music video' (default), a new Producer 'session', or a new 'project'"),
+        .default("session")
+        .describe("Open a new Producer/Video 'session' (default), 'music_video', or a new 'project'"),
       attach_mp3: z
         .boolean()
         .default(true)
-        .describe("Automatically attach the folder's MP3 file via 'Add -> Audio'"),
+        .describe("Automatically attach the folder's MP3 file via 'Upload audio file'"),
       video_model: z
         .string()
         .optional()
-        .describe("Optional video model name to select under Settings -> Video Generation"),
+        .describe("Optional video model name to select under Chat settings -> Video Generation"),
     },
   },
   (args) =>
@@ -796,7 +851,9 @@ server.registerTool(
       initiate_session_overview_first: z
         .boolean()
         .default(true)
-        .describe("Send the master Visual Production Bible & Storyboard overview to the session before generating clips"),
+        .describe(
+          "Send the master Visual Production Bible & Storyboard overview to the session before generating clips"
+        ),
       video_model: z.string().optional().describe("Optional video model to select before generating"),
       per_video_timeout_seconds: z
         .number()
@@ -871,7 +928,9 @@ server.registerTool(
       target: z
         .string()
         .optional()
-        .describe("Button text/CSS selector (for click/fill), URL (for navigate), or file path (for upload_audio/upload_image)"),
+        .describe(
+          "Button text/CSS selector (for click/fill), URL (for navigate), or file path (for upload_audio/upload_image)"
+        ),
       value: z.string().optional().describe("Text to enter into the prompt/input (for fill)"),
       save_path: z.string().optional().describe("Optional output path for screenshot"),
     },
@@ -969,7 +1028,8 @@ server.registerPrompt(
   "music_video_production_workflow",
   {
     title: "End-to-End Music Video Production Workflow",
-    description: "Step-by-step guide for Claude to produce a music video from an MP3 folder using Gemini and Google Flow Music.",
+    description:
+      "Step-by-step guide for Claude to produce a music video from an MP3 folder using Gemini and Google Flow Music.",
     argsSchema: {
       folder_path: z.string().describe("Path to the folder containing the MP3 file"),
     },
