@@ -13,17 +13,19 @@ import { saveProject } from "./storyboard.js";
 import type { StoryboardProject } from "./types.js";
 
 export const PLAYBOOK = {
-  critical_rules: [
-    "NEVER run bash/PowerShell searches to hunt for flow-music-mcp config files or API keys on the filesystem. Everything is managed directly through these MCP tools.",
-    "Valid Google AI Studio keys start with EITHER 'AIza' OR 'AQ.' (2026 format). Accept 'AQ.' keys immediately via 'gemini_set_api_key' without questioning the user.",
-    "You NEVER need to restart Claude to apply a new API key or image model. All keys and models are read dynamically on every call.",
-    "If the user's Gemini API key is on the Free Tier (where image models have limit: 0), 'gemini_generate_character_image' and 'gemini_generate_scene_images' automatically fall back to generating the images inside the signed-in Google Flow Music Chrome window.",
-  ],
+  config_paths: {
+    gemini_key_file: KEY_FILE,
+    supported_key_prefixes: ["AIza", "AQ."],
+    image_generation_modes: [
+      "Gemini REST API (gemini-3.1-flash-image, gemini-nano-banana-2.1, gemini-2.5-flash-image)",
+      "Gemini Web Chat fallback (https://gemini.google.com/app via CDP port 9334)",
+    ],
+  },
   workflow_steps: [
-    "1. Call 'project_connect' (or 'music_identify_lyrics' directly with folder_path) to connect to the user's MP3 song folder and extract timestamped lyrics & initial sub-10s scenes.",
-    "2. Show the lyrics and sub-10s scenes (including each scene's frame_mode: 'generate_start_frame' vs 'use_previous_last_frame') to the user for review/editing ('storyboard_edit_scene').",
-    "3. Define characters ('storyboard_upsert_character') and generate character sheets ('gemini_generate_character_image'), then generate scene starting keyframes ('gemini_generate_scene_images').",
-    "4. Once scene images are approved, call 'flow_music_new_session' and 'flow_music_generate_videos' to initiate the storyboard in Google Flow Music (flowmusic.app) and download all MP4 scene clips.",
+    "1. project_connect / music_identify_lyrics: Connect to the MP3 folder and extract timestamped lyrics & initial sub-10s scenes.",
+    "2. storyboard_edit_scene: Review or edit scenes (each scene uses frame_mode 'generate_start_frame' or 'use_previous_last_frame').",
+    "3. storyboard_upsert_character / gemini_generate_character_image / gemini_generate_scene_images: Generate character sheets and scene starting keyframes.",
+    "4. flow_music_new_session / flow_music_generate_videos: Initiate the storyboard in Google Flow Music (flowmusic.app) and download MP4 scene clips.",
   ],
 };
 

@@ -72,8 +72,6 @@ const reply = async (work: Promise<unknown>): Promise<ToolResult> => {
           text: JSON.stringify(
             {
               error: err instanceof Error ? err.message : String(err),
-              important_rule:
-                "Do NOT run background shell searches on the filesystem or ask the user to restart Claude. Use the MCP tools directly.",
             },
             null,
             2
@@ -133,7 +131,7 @@ async function runWithPatience(toolName: string, work: Promise<unknown>): Promis
   return {
     still_working: true,
     task_id: task.task_id,
-    note: `${toolName} is still running in the background. Call 'flow_music_wait' with task_id="${task.task_id}" to collect the result. Do NOT re-run ${toolName}.`,
+    note: `${toolName} is running in the background. Call 'flow_music_wait' with task_id="${task.task_id}" to collect the result.`,
   };
 }
 
@@ -146,7 +144,7 @@ server.registerTool(
   {
     title: "Connect to MP3 Project Folder",
     description:
-      "Step 0: Connect to a local folder where an MP3 (or WAV/M4A) is placed. Initializes or loads storyboard.json, STORYBOARD.md, and creates characters/, scenes/, and videos/ subfolders. Never search the filesystem for config files; call this tool directly.",
+      "Step 0: Connect to a local folder where an MP3 (or WAV/M4A) is placed. Initializes or loads storyboard.json, STORYBOARD.md, and creates characters/, scenes/, and videos/ subfolders.",
     inputSchema: {
       folder_path: z.string().describe("Absolute path to the folder containing the MP3 file"),
       mp3_filename: z
@@ -199,7 +197,7 @@ server.registerTool(
   {
     title: "Set Gemini API Key & Optional Model Preferences",
     description:
-      "Save a Google AI Studio / Gemini API key to ~/.flow-music-mcp/gemini-key (no restart needed). IMPORTANT: Valid Google AI Studio keys start with EITHER 'AIza' (older format) OR 'AQ.' (newer 2026 format). Accept 'AQ.' keys immediately without questioning the user.",
+      "Save a Google AI Studio / Gemini API key (starting with 'AIza' or 'AQ.') to ~/.flow-music-mcp/gemini-key and optionally set model preferences in ~/.flow-music-mcp/config.json.",
     inputSchema: {
       api_key: z
         .string()
@@ -214,7 +212,7 @@ server.registerTool(
         .boolean()
         .optional()
         .describe(
-          "If true, generates character and scene images directly through the signed-in Google Flow Music Chrome window instead of the REST API"
+          "If true, generates character and scene images through the signed-in Gemini Web Chat (https://gemini.google.com/app) Chrome window"
         ),
     },
   },
@@ -234,7 +232,6 @@ server.registerTool(
         return {
           configured: true,
           ...res,
-          note: "Gemini API key saved and active immediately (no restart required).",
         };
       })()
     )
