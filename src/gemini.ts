@@ -2,7 +2,7 @@ import { setDefaultResultOrder } from "node:dns";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, extname, join } from "node:path";
-import { getFlowMusicPage } from "./chrome.js";
+import { getFlowMusicPage, launchOrAttachChrome } from "./chrome.js";
 import {
   formatSecondsToTimestamp,
   formatShotId,
@@ -496,108 +496,213 @@ Respond strictly with valid JSON matching this structure:
   };
 }
 
+let freeTierZeroQuotaDetected = false;
+
 /**
- * Browser fallback: When a user's Google AI Studio API key is on the Free Tier (where *-image models
- * return 429 limit: 0), we can generate the image using the user's signed-in Google Flow Music
- * (flowmusic.app) Chrome session, where image generation is included with their subscription!
+ * Generates an image using the user's signed-in Google Gemini Web Chat (`https://gemini.google.com/app`)
+ * inside the persistent MCP Chrome profile (port 9334).
+ *
+ * Why this is awesome:
+ * 1. Completely free / included with the user's Google account (no AI Studio API billing needed!).
+ * 2. Supports attaching Character Model Sheet reference PNGs via ClipboardEvent("paste") DataTransfer
+ *    so scene start frames maintain strict character consistency without opening OS file dialogs.
+ * 3. Extracts the generated `blob:https://gemini.google.com/...` image on the same origin (or via HTML5
+ *    canvas) with zero CORS issues.
  */
-async function generateImageViaFlowMusicBrowser(options: {
+export async function generateImageViaGeminiWebChat(options: {
   prompt: string;
+  aspectRatio?: string;
   referenceImagePaths?: string[];
   outputFilePath: string;
 }): Promise<{ savedPath: string; modelUsed: string }> {
-  const page = await getFlowMusicPage();
+  const b = await launchOrAttachChrome();
+  const ctx = b.contexts()[0] ?? (await b.newContext());
 
-  // Snapshot existing images on the page (> 180px wide)
-  const beforeImgs = new Set<string>(
-    await page.evaluate(() =>
-      Array.from(document.querySelectorAll("img"))
-        .filter((img) => img.naturalWidth >= 180 || img.width >= 180)
-        .map((img) => img.currentSrc || img.src || "")
-        .filter(Boolean)
-    )
-  );
+  // Reuse an existing gemini.google.com tab or open a new tab
+  let page = ctx.pages().find((p) => p.url().startsWith("https://gemini.google.com"));
+  const openedNewTab = !page;
+  if (!page) {
+    page = await ctx.newPage();
+  }
 
-  // Attach reference image if available via input[type="file"][aria-label="Upload image file"]
-  for (const refPath of options.referenceImagePaths ?? []) {
-    if (refPath && existsSync(refPath)) {
-      const imgInput = page.locator('input[type="file"][aria-label*="image" i]').first();
-      if ((await imgInput.count()) > 0) {
-        await imgInput.setInputFiles(refPath);
-        await page.waitForTimeout(1500);
+  try {
+    // Navigate to a fresh Gemini chat so the DOM has no prior generated images
+    await page.goto("https://gemini.google.com/app", {
+      waitUntil: "domcontentloaded",
+      timeout: 30_000,
+    });
+    await page.waitForTimeout(2500);
+
+    const promptBox = page
+      .locator(
+        'div[role="textbox"][aria-label*="prompt" i], rich-textarea div[contenteditable="true"], div[contenteditable="true"]'
+      )
+      .first();
+
+    await promptBox.waitFor({ state: "visible", timeout: 15_000 });
+    await promptBox.click();
+
+    // Snapshot any existing blob images (e.g., avatars) before we attach or generate
+    const knownBlobUrls = new Set<string>(
+      await page.evaluate(() =>
+        Array.from(document.querySelectorAll("img"))
+          .map((img) => img.currentSrc || img.src || "")
+          .filter(Boolean)
+      )
+    );
+
+    // Attach reference images (e.g. Character Model Sheet PNGs) via synthetic ClipboardEvent("paste")
+    for (const refPath of options.referenceImagePaths ?? []) {
+      if (refPath && existsSync(refPath)) {
+        const ext = extname(refPath).toLowerCase();
+        const mimeType = ext === ".jpg" || ext === ".jpeg" ? "image/jpeg" : "image/png";
+        const fileName = basename(refPath);
+        const b64Data = readFileSync(refPath).toString("base64");
+
+        await page.evaluate(
+          async ({ b64, name, mime }: { b64: string; name: string; mime: string }) => {
+            const binStr = atob(b64);
+            const bytes = new Uint8Array(binStr.length);
+            for (let i = 0; i < binStr.length; i++) {
+              bytes[i] = binStr.charCodeAt(i);
+            }
+            const blob = new Blob([bytes], { type: mime });
+            const file = new File([blob], name, { type: mime });
+            const dt = new DataTransfer();
+            dt.items.add(file);
+
+            const editor =
+              document.querySelector('div[role="textbox"][aria-label*="prompt" i]') ||
+              document.querySelector('rich-textarea div[contenteditable="true"]') ||
+              document.querySelector('div[contenteditable="true"]');
+            if (!editor) throw new Error("Gemini Chat prompt textbox not found for image paste");
+
+            const pasteEvent = new ClipboardEvent("paste", {
+              bubbles: true,
+              cancelable: true,
+              clipboardData: dt,
+            });
+            editor.dispatchEvent(pasteEvent);
+          },
+          { b64: b64Data, name: fileName, mime: mimeType }
+        );
+
+        // Give Gemini Web Chat a moment to process the pasted attachment thumbnail
+        await page.waitForTimeout(2200);
       }
     }
-  }
 
-  const chatBox = page
-    .locator('textarea[aria-label="Chat message"], textarea[placeholder*="create" i], textarea')
-    .first();
-  if ((await chatBox.count()) === 0) {
-    throw new Error(
-      "Could not find chat composer in Google Flow Music browser window for image fallback."
+    // Record any newly added attachment thumbnail URLs so we don't confuse them with the generated output image
+    const afterAttachUrls = await page.evaluate(() =>
+      Array.from(document.querySelectorAll("img"))
+        .map((img) => img.currentSrc || img.src || "")
+        .filter(Boolean)
     );
-  }
+    for (const u of afterAttachUrls) {
+      knownBlobUrls.add(u);
+    }
 
-  await chatBox.click({ timeout: 5000 });
-  await chatBox.fill(`Generate a still keyframe image: ${options.prompt}`);
-  await page.waitForTimeout(300);
+    // Fill the image generation prompt
+    const ratioText = options.aspectRatio || "16:9";
+    const fullChatPrompt =
+      (options.referenceImagePaths?.length ?? 0) > 0
+        ? `Generate a single ${ratioText} widescreen image maintaining strict visual consistency with the attached character/style reference image. Output the generated image directly: ${options.prompt}`
+        : `Generate a single ${ratioText} widescreen image. Output the generated image directly: ${options.prompt}`;
 
-  const sendBtn = page.locator('button[aria-label="Send message"]').first();
-  if ((await sendBtn.count()) > 0 && (await sendBtn.isVisible().catch(() => false))) {
-    await sendBtn.click({ timeout: 4000 });
-  } else {
-    await page.keyboard.press("Enter");
-  }
+    await promptBox.click();
+    await promptBox.fill(fullChatPrompt);
+    await page.waitForTimeout(500);
 
-  // Poll for a new large generated image in the session
-  const deadline = Date.now() + 90_000;
-  while (Date.now() < deadline) {
-    await page.waitForTimeout(2500);
-    const newImgSrc = await page.evaluate((known: string[]) => {
-      const knownSet = new Set(known);
-      const imgs = Array.from(document.querySelectorAll("img")).filter(
-        (img) =>
-          (img.naturalWidth >= 200 || img.width >= 200) &&
-          !img.src.includes("avatar") &&
-          !img.src.includes("logo")
-      );
-      for (const img of imgs.reverse()) {
-        const s = img.currentSrc || img.src || "";
-        if (s && !knownSet.has(s)) return s;
-      }
-      return null;
-    }, Array.from(beforeImgs));
+    // Click Send message
+    const sendBtn = page
+      .locator('button[aria-label*="Send message" i], button[aria-label*="Send" i]')
+      .first();
+    if ((await sendBtn.count()) > 0 && (await sendBtn.isVisible().catch(() => false))) {
+      await sendBtn.click({ timeout: 5000 });
+    } else {
+      await page.keyboard.press("Enter");
+    }
 
-    if (newImgSrc) {
-      const b64 = await page.evaluate(async (srcUrl: string) => {
-        const resp = await fetch(srcUrl, { credentials: "include" });
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        const buf = await resp.arrayBuffer();
-        let binary = "";
-        const bytes = new Uint8Array(buf);
-        const chunkSize = 0x8000;
-        for (let i = 0; i < bytes.length; i += chunkSize) {
-          binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+    // Poll up to 75 seconds for the generated image (`alt` containing "AI generated" or new large blob image)
+    const deadline = Date.now() + 75_000;
+    while (Date.now() < deadline) {
+      await page.waitForTimeout(2500);
+
+      const extractedBase64 = await page.evaluate(async (ignoredUrls: string[]) => {
+        const ignoreSet = new Set(ignoredUrls);
+        const candidates = Array.from(document.querySelectorAll("img")).filter((img) => {
+          const src = img.currentSrc || img.src || "";
+          if (!src || ignoreSet.has(src)) return false;
+          const alt = (img.alt || "").toLowerCase();
+          if (alt === "attachment" || alt.includes("profile")) return false;
+          const w = img.naturalWidth || img.width;
+          const h = img.naturalHeight || img.height;
+          return img.complete && w >= 250 && h >= 200;
+        });
+
+        if (candidates.length === 0) return null;
+        const targetImg = candidates[candidates.length - 1];
+        const srcUrl = targetImg.currentSrc || targetImg.src || "";
+
+        // Method A: Same-origin fetch on blob:https://gemini.google.com/...
+        try {
+          const resp = await fetch(srcUrl);
+          if (resp.ok) {
+            const buf = await resp.arrayBuffer();
+            const bytes = new Uint8Array(buf);
+            if (bytes.length > 2000) {
+              let binary = "";
+              const chunkSize = 0x8000;
+              for (let i = 0; i < bytes.length; i += chunkSize) {
+                binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+              }
+              return btoa(binary);
+            }
+          }
+        } catch {
+          // Fall through to Canvas extraction
         }
-        return btoa(binary);
-      }, newImgSrc);
 
-      if (b64 && b64.length > 100) {
-        writeFileSync(options.outputFilePath, Buffer.from(b64, "base64"));
+        // Method B: Draw HTMLImageElement directly to an HTML5 Canvas
+        try {
+          const canvas = document.createElement("canvas");
+          canvas.width = targetImg.naturalWidth || targetImg.width || 1024;
+          canvas.height = targetImg.naturalHeight || targetImg.height || 576;
+          const ctx2d = canvas.getContext("2d");
+          if (ctx2d) {
+            ctx2d.drawImage(targetImg, 0, 0, canvas.width, canvas.height);
+            const dataUrl = canvas.toDataURL("image/png");
+            return dataUrl.replace(/^data:image\/png;base64,/, "");
+          }
+        } catch {
+          // Ignore
+        }
+        return null;
+      }, Array.from(knownBlobUrls));
+
+      if (extractedBase64 && extractedBase64.length > 500) {
+        writeFileSync(options.outputFilePath, Buffer.from(extractedBase64, "base64"));
         return {
           savedPath: options.outputFilePath,
-          modelUsed: "flowmusic-browser-nano-banana",
+          modelUsed: "gemini-web-chat (gemini.google.com/app)",
         };
       }
     }
-  }
 
-  throw new Error("Timed out waiting for image generation in Google Flow Music browser fallback.");
+    throw new Error(
+      "Timed out waiting for Gemini Web Chat (https://gemini.google.com/app) to finish rendering the image."
+    );
+  } finally {
+    if (openedNewTab) {
+      await page.close().catch(() => {});
+    }
+  }
 }
 
 /**
  * Generates an image via Gemini API (supporting multimodal reference images)
- * using the live 2026 model names + dynamic model discovery + automatic browser fallback if quota is 0.
+ * using the live 2026 model names + automatic fallback to Gemini Web Chat (`https://gemini.google.com/app`)
+ * when the user's API key is on the unbilled Free Tier (`limit: 0`).
  */
 export async function callGeminiImageGeneration(options: {
   prompt: string;
@@ -635,9 +740,8 @@ export async function callGeminiImageGeneration(options: {
   );
 
   const errors: string[] = [];
-  let hitFreeTierZeroQuota = false;
 
-  if (apiKey && !cfg.prefer_browser_image_generation) {
+  if (apiKey && !cfg.prefer_browser_image_generation && !freeTierZeroQuotaDetected) {
     for (const model of modelsToTry) {
       try {
         const promptWithRefs =
@@ -672,8 +776,8 @@ export async function callGeminiImageGeneration(options: {
           const errText = await res.text();
           errors.push(`${model}: HTTP ${res.status} ${errText.slice(0, 220)}`);
           if (res.status === 429 && /free_tier_requests|limit:\s*0|RESOURCE_EXHAUSTED/i.test(errText)) {
-            hitFreeTierZeroQuota = true;
-            // All free-tier image models share limit: 0 on an unbilled AI Studio key, so break early to browser fallback
+            freeTierZeroQuotaDetected = true;
+            // Cache that this API key is on the Free Tier (limit: 0 for image models) and switch immediately to Gemini Web Chat!
             break;
           }
           continue;
@@ -703,22 +807,21 @@ export async function callGeminiImageGeneration(options: {
     }
   }
 
-  // If the Gemini API key hit Free-Tier limit: 0 (HTTP 429) or prefer_browser_image_generation is set,
-  // automatically try generating the image inside the user's signed-in Google Flow Music browser!
+  // Fallback (or primary when Free-Tier API key has limit: 0): Use signed-in Gemini Web Chat (https://gemini.google.com/app)
   try {
-    return await generateImageViaFlowMusicBrowser({
+    return await generateImageViaGeminiWebChat({
       prompt: options.prompt,
+      aspectRatio: options.aspectRatio,
       referenceImagePaths: options.referenceImagePaths,
       outputFilePath: options.outputFilePath,
     });
   } catch (browserErr) {
-    const quotaExplanation = hitFreeTierZeroQuota
-      ? `\n\nIMPORTANT ROOT CAUSE: Your Google AI Studio API key is currently on the Free Tier where image generation models ('gemini-3.1-flash-image', 'gemini-2.5-flash-image', 'gemini-nano-banana-2.1') have 'free_tier_requests limit: 0' unless Cloud Billing is linked at https://aistudio.google.com/api-keys (notice the 'No API key selected / paid-api-key-button' in AI Studio). Do NOT restart Claude or change environment variables—either enable billing on the key in Google AI Studio OR keep the Google Flow Music Chrome window open so browser image generation can run.`
-      : "";
     throw new Error(
-      `Image generation failed.\nAPI Attempts:\n- ${errors.join("\n- ")}\nBrowser Fallback: ${
+      `Image generation failed.\nAPI Attempts:\n- ${
+        errors.length ? errors.join("\n- ") : "Skipped (Free-Tier API key limit: 0 cached)"
+      }\nGemini Web Chat Fallback (https://gemini.google.com/app): ${
         browserErr instanceof Error ? browserErr.message : String(browserErr)
-      }${quotaExplanation}`
+      }\nEnsure the MCP Chrome window is open and signed into your Google account (run flow_music_login if closed).`
     );
   }
 }
